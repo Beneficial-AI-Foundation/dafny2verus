@@ -1,5 +1,8 @@
 import asyncio
+import os
 import re
+import subprocess
+import tempfile
 from pathlib import Path
 import random
 from dotenv import load_dotenv
@@ -76,20 +79,42 @@ Use the `verus` tool to make sure your output compiles
 
 def load_dafny_bench():
     """Load the DafnyBench dataset from Hugging Face"""
-    print("Loading DafnyBench dataset...")
+    logfire.info("Loading DafnyBench dataset...")
     dataset = load_dataset("wendy-sun/DafnyBench", split="test")
     return dataset
 
 
+def is_sample_already_successful(verus_filename: str) -> bool:
+    """Check if a sample already has success: true in its success.yml file"""
+    artifact_path = ARTIFACTS / "dafnybench" / verus_filename
+    success_file = artifact_path / "success.yml"
+
+    if not success_file.exists():
+        return False
+
+    try:
+        with open(success_file, "r") as success_yaml:
+            data = yaml.safe_load(success_yaml)
+        return data.get("success", False)
+    except Exception:
+        return False
+
+
 async def process_item(
-    idx: int, item: dict, max_retries: int = 32, base_delay: float = 1.0
+    idx: int, item: dict, max_retries: int = 32, base_delay: float = 5.0
 ) -> dict:
     """Process a single item from the dataset with exponential backoff"""
     dafny_code = item["ground_truth"]
     dafny_filename = Path(item["test_file"])
-    print(f"Processing item {idx + 1}: {dafny_filename}")
     verus_filename = dafny_filename.stem
     artifact_path = ARTIFACTS / "dafnybench" / verus_filename
+
+    # Check if this sample already succeeded
+    if is_sample_already_successful(verus_filename):
+        logfire.info(f"Skipping item {idx + 1}: {dafny_filename} (already successful)")
+        return {"path": artifact_path, "success": True}
+
+    logfire.info(f"Processing item {idx + 1}: {dafny_filename}")
     artifact_path.mkdir(parents=True, exist_ok=True)
 
     # Exponential backoff retry logic
@@ -99,10 +124,45 @@ async def process_item(
             with open(artifact_path / "verus_code.rs", "w") as verus_file:
                 verus_file.write(verus_code)
 
-            result = verus_tool(verus_code)
+            # Run verus verification directly instead of using the tool
+            # Create temporary file with the code
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=".rs", delete=False
+            ) as tmpfile:
+                tmpfile.write(verus_code)
+                temp_file = tmpfile.name
+
+            try:
+                # Run verus verification
+                result = subprocess.run(
+                    [cfg["verus_path"], temp_file],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+                verification_success = result.returncode == 0
+                verification_output = result.stdout
+                verification_error = result.stderr
+            except subprocess.TimeoutExpired:
+                verification_success = False
+                verification_output = ""
+                verification_error = "Verus verification timed out after 30 seconds"
+            except OSError as exc:
+                verification_success = False
+                verification_output = ""
+                verification_error = f"Error running Verus: {str(exc)}"
+            finally:
+                # Clean up temporary file
+                try:
+                    os.unlink(temp_file)
+                except OSError:
+                    pass
+
             info = {
-                "success": result.success,
+                "success": verification_success,
                 "num_iterations": num_iterations,
+                "verification_output": verification_output,
+                "verification_error": verification_error,
             }
             with open(artifact_path / "success.yml", "w") as success_file:
                 yaml.dump(
@@ -110,18 +170,18 @@ async def process_item(
                     success_file,
                 )
 
-            return {"path": artifact_path, "success": result.success}
+            return {"path": artifact_path, "success": verification_success}
 
         except ModelHTTPError as exc:
             if attempt == max_retries:
-                print(
+                logfire.info(
                     f"Failed to process item {idx + 1} after {max_retries} retries: {exc}"
                 )
                 raise
 
             # Calculate delay with exponential backoff and jitter
             delay = base_delay * (2**attempt) + random.uniform(0, 1)
-            print(
+            logfire.info(
                 f"Rate limited on item {idx + 1}, attempt {attempt + 1}/{max_retries + 1}. Retrying in {delay:.2f}s..."
             )
             await asyncio.sleep(delay)
@@ -134,6 +194,16 @@ async def main_async() -> None:
 
     # Load the dataset
     dataset = load_dafny_bench()
+
+    # Check for existing successful samples
+    skipped_count = 0
+
+    # Pre-filter to see how many we'll skip
+    for idx, item in enumerate(dataset):
+        dafny_filename = Path(item["test_file"])
+        verus_filename = dafny_filename.stem
+        if is_sample_already_successful(verus_filename):
+            skipped_count += 1
 
     # Limit concurrent API calls to prevent rate limiting
     semaphore = asyncio.Semaphore(3)  # Allow max 3 concurrent agent calls
@@ -150,8 +220,19 @@ async def main_async() -> None:
 
     with open(ARTIFACTS / "dafnybench_results.yml", "w") as results_file:
         yaml.dump(results, results_file)
-    percentage_successful = sum(res["success"] for res in results) / len(results)
-    print(f"Translation to verus was {100 * percentage_successful}% successful.")
+
+    # Calculate statistics
+    total_successful = sum(res["success"] for res in results)
+    newly_successful = sum(
+        res["success"] for res in results if not res.get("skipped", False)
+    )
+    percentage_successful = total_successful / len(results)
+
+    print("Results:")
+    print(f"  Previously successful: {skipped_count}")
+    print(f"  Newly successful: {newly_successful}")
+    print(f"  Total successful: {total_successful}")
+    print(f"  Overall success rate: {100 * percentage_successful:.1f}%")
 
 
 def main() -> None:
