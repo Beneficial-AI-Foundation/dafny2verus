@@ -57,12 +57,12 @@ system: |
           if a <= b { a } else { b }
       }
 
-      fn minMethod(a: int, b: int) -> (c: int)
+      fn minMethod(a: i64, b: i64) -> (c: i64)
           requires true,
           ensures
               c <= a && c <= b,
               c == a || c == b,
-              c == min(a, b)
+              c == min(a as int, b as int)
       {
           if a <= b {
               a
