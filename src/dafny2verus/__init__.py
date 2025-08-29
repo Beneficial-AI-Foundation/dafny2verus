@@ -108,6 +108,13 @@ async def process_item(
     dafny_filename = Path(item["test_file"])
     verus_filename = dafny_filename.stem
     artifact_path = ARTIFACTS / "dafnybench" / verus_filename
+    
+    # Create the output filename by replacing .dfy extension with .rs
+    if dafny_filename.suffix.lower() == '.dfy':
+        output_filename = dafny_filename.with_suffix('.rs').name
+    else:
+        # If no .dfy extension, just add .rs
+        output_filename = f"{dafny_filename.name}.rs"
 
     # Check if this sample already succeeded
     if is_sample_already_successful(verus_filename):
@@ -121,7 +128,7 @@ async def process_item(
     for attempt in range(max_retries + 1):
         try:
             verus_code, num_iterations = await translate_dafny_to_verus(dafny_code)
-            with open(artifact_path / "verus_code.rs", "w") as verus_file:
+            with open(artifact_path / output_filename, "w") as verus_file:
                 verus_file.write(verus_code)
 
             # Run verus verification directly instead of using the tool
